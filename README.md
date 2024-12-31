@@ -84,4 +84,4 @@ O tamanho total do disco impacta diretamente no número de segmentos gerados. Pa
 
 ## Contribuição
 
-Contribuições são bem-vindas! Caso encontre bugs, tenha sugestões ou queira colaborar com novas funcionalidades, entre em contato por meio do repositório oficial (insira aqui o link do repositório, se aplicável).
+Contribuições são bem-vindas! Caso encontre bugs, tenha sugestões ou queira colaborar com novas funcionalidades, entre em contato por meio do repositório oficial https://github.com/Erik-Castro/easy_tools.git.
