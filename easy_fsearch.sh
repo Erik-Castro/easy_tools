@@ -38,6 +38,42 @@ error_registry() {
     ERROR+=("$1")
 }
 
+get_hash() {
+    # Verifica se o OpenSSL está instalado
+    if ! command -v openssl &>/dev/null; then
+        echo "Erro: OpenSSL é necessário para calcular o hash." >&2
+        exit 2
+    fi
+
+    # Define o algoritmo padrão
+    local algorithm="sha3-256"
+
+    # Valida se há argumento fornecido
+    if [[ -z ${1+x} ]]; then
+        # Calcula o hash da entrada padrão
+        hash_output=$(openssl dgst -"$algorithm" 2>/dev/null)
+        if [[ $? -ne 0 ]]; then
+            echo "Erro: Falha ao calcular o hash com o algoritmo '$algorithm'." >&2
+            exit 3
+        fi
+        echo -n "$hash_output" | awk '{print $2}'
+    else
+        # Verifica se o arquivo existe
+        if [[ ! -f "$1" ]]; then
+            echo "Erro: O arquivo '$1' não foi encontrado." >&2
+            exit 4
+        fi
+
+        # Calcula o hash do arquivo
+        hash_output=$(openssl dgst -"$algorithm" "$1" 2>/dev/null)
+        if [[ $? -ne 0 ]]; then
+            echo "Erro: Falha ao calcular o hash com o algoritmo '$algorithm'." >&2
+            exit 3
+        fi
+        echo -n "$hash_output" | awk '{print $2}'
+    fi
+}
+
 # Função para verificar dependências
 check_dependencies() {
     local missing=()
@@ -70,8 +106,7 @@ directory_is_valid() {
 
 # Arquivos padrão
 standart_files() {
-    local standart_directorys=("/tmp" "/var/tmp")
-    local standart_dir=("/tmp" "/var/tmp")
+    local standart_dir=("/tmp" "/var/tmp" "/home/*/.config/google-chrome/Default" "/home/*/.mozilla/firefox")
     local results=()
 
     if [[ -t 1 ]]; then
@@ -86,19 +121,21 @@ standart_files() {
     fi
 
     for dir in ${standart_dir[@]}; do
+        # Se não houver, ignore
+        [[ ! -d "$dir" ]] && continue
+
         results+=("$(find "${dir}" -maxdepth 7)")
     done
 
     echo "$results" | while IFS= read -r line; do
         if [[ -f "$line" ]]; then
-            echo -e "${arch}Arquivo encontrado:${res}${bol} ${line}${res}"
-
+            echo -e "${arch}Arquivo encontrado:${res}${bol} ${line}"
         elif [[ -d "$line" ]]; then
             echo -e "${dire}Diretório encontrado:${res}${bol} ${line}${res}"
         else
             echo -e "${bol}Outro tipo encontrado: ${line}${res}"
         fi
-    done
+    done | sort
 }
 
 # Funcção de busca
@@ -106,6 +143,7 @@ forensic_search() {
     echo -e "\e[33;1m[AVISO]\e[0;1m: Talve seja presciso permissões de root.\e[0m"
 
     # buscando nos diretórios temporários
+    echo "Olhando locais padrão"
     standart_files
 }
 
