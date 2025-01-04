@@ -16,6 +16,25 @@ DIRECTORY="."
 REGEX=""
 QUERY=""
 
+# Temporários
+TEMP_FILE[0]=$(mktemp -p. 2>/dev/null || (
+    echo "Não foi possivel criar o arquivo temporário"
+    exit 2
+))
+
+# Limpa arquivos temporaŕios
+clean_temp() {
+    for tmp in "${TEMP_FILE[@]}"; do
+        echo "Removendo arquivo temporário: ${tmp}"
+        [[ -e "${tmp}" ]] && (shred -uzn 33 "${tmp}")
+
+        # Garantindo que removi :)
+        [[ -e "${tmp}" ]] && rm -rf "${tmp}"
+    done
+}
+
+trap "clean_temp" SIGTERM SIGINT SIGKILL SIGABRT SIGHUP EXIT
+
 # Função para exibir mensagens de erro
 msg_error() {
     local message="${1:-Algo inesperado aconteceu.}"
@@ -105,9 +124,9 @@ directory_is_valid() {
 }
 
 # Arquivos padrão
-standart_files() {
-    local standart_dir=("/tmp" "/var/tmp" "/home/*/.config/google-chrome/Default" "/home/*/.mozilla/firefox")
-    local results=()
+standard_files() {
+    local standard_dir=("/home/*/.mozilla/firefox" "/tmp" "/var/tmp" "/home/*/.config/google-chrome/Default" "/var/log" "/etc" "/root" "/usr/local" "/opt" "/var/www" "/home/*/.ssh" "/home/*/.gnupg" "/var/backups")
+    local line
 
     if [[ -t 1 ]]; then
         local arch="\e[1;34m"
@@ -120,14 +139,15 @@ standart_files() {
         bol=""
     fi
 
-    for dir in ${standart_dir[@]}; do
+    for dir in ${standard_dir[@]}; do
         # Se não houver, ignore
         [[ ! -d "$dir" ]] && continue
 
-        results+=("$(find "${dir}" -maxdepth 7)")
+        # Realiza a busca no diretorio da vez
+        find "${dir}" -maxdepth 5 >>${TEMP_FILE[0]}
     done
 
-    echo "$results" | while IFS= read -r line; do
+    while IFS= read -r line; do
         if [[ -f "$line" ]]; then
             echo -e "${arch}Arquivo encontrado:${res}${bol} ${line}"
         elif [[ -d "$line" ]]; then
@@ -135,7 +155,26 @@ standart_files() {
         else
             echo -e "${bol}Outro tipo encontrado: ${line}${res}"
         fi
-    done | sort
+    done <${TEMP_FILE[0]} | sort
+}
+
+# Buscar por logs
+query_logs() {
+    local line
+    local temp_file="${TEMP_FILE[0]}" # Garantir compatibilidade com a variável TEMP_FILE
+
+    # Verificar se o arquivo temporário existe
+    if [[ ! -f "$temp_file" ]]; then
+        msg_error "O arquivo temporário '${temp_file}' não foi encontrado!"
+        return 1
+    fi
+
+    # Filtrar arquivos do diretório '/var/log/' e calcular seus hashes
+    while IFS= read -r line; do
+        if [[ -f "$line" && "$line" == /var/log/* ]]; then
+            echo "Arquivo de log: \"${line}\" hash: $(get_hash "$line")"
+        fi
+    done < <(grep '^/var/log/' "$temp_file")
 }
 
 # Funcção de busca
@@ -144,7 +183,10 @@ forensic_search() {
 
     # buscando nos diretórios temporários
     echo "Olhando locais padrão"
-    standart_files
+    standard_files
+
+    echo "Buscando arquivos de log"
+    query_logs
 }
 
 # Verificar dependências
@@ -164,3 +206,4 @@ directory_is_valid
 echo -e "\e[1;32mTodas as dependências foram verificadas com sucesso!\e[0m"
 
 forensic_search
+clean_temp
