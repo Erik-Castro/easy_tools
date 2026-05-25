@@ -12,9 +12,11 @@ All comments, error messages, and docs are in **Portuguese** (Brazilian). CLI ou
 
 ```bash
 sudo ./easy_fclone.sh -s /dev/sdX -d /path/to/dest -S 1G -B 32M -n case_name [-N notes]
+# Restore mode (no root needed for file I/O):
+./easy_fclone.sh -r -s /path/to/segments -d /output.img
 ```
 
-Requires **root** for device access. Dependencies: `dd`, `openssl`, `uuidgen`/`dbus-uuidgen`, `lsblk`, `fdisk`, `numfmt` (coreutils). Bash 4.0+.
+Requires **root** for device access (clone mode). Dependencies: `dd`, `openssl`, `uuidgen`/`dbus-uuidgen`, `lsblk`, `fdisk`, `numfmt` (coreutils). Bash 4.0+.
 
 ## Project structure
 
@@ -32,6 +34,9 @@ Only one source file. No tests, no build, no CI.
 - Headers are deferred: dd writes data first, then headers are appended in a second pass after the hash is collected.
 - `conv=sync` removed — last segment count is recalculated per iteration to avoid zero-padding.
 - `get_vol_hash` / `get_calculated_count` removed — inlined or replaced.
+- Restore mode (`-r`): reads segment directory, iterates `.bin` files sorted by segment number, validates per-segment HEADER_HASH (integrity) and HASH_SEGMENT (data), cross-checks HASH_VOLUME on last segment. Uses `tee -a` for single-pass append + hash of output data.
+- `parse_header` finds header markers via `grep -a -b -o -P` on the raw dd pipe (avoids Bash null-byte stripping in `$(...)`). Never store binary tail in a Bash variable.
+- Header structure: pipe-delimited key:value fields appended to each segment file after the binary data. Last field is `|HEADER_HASH:<sha3-256>` covering everything from `|MODEL:` up to (exclusive) `|HEADER_HASH:`.
 
 ## Conventions
 
