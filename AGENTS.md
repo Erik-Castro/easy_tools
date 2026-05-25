@@ -27,8 +27,9 @@ Only one source file. No tests, no build, no CI.
 - Version is tracked in script header comments (`# Version x.y.z`), parsed by `get_version` via `grep` on `$0`.
 - Segments are binary dumps with a pipe-delimited header **appended** to each segment file after dd writes the data.
 - Hash algorithm is SHA3–256 (`openssl dgst -sha3-256`).
-- Size parsing uses `numfmt --from=auto` (accepts K, M, G, T, P, Y suffixes).
+- Size parsing uses `parse_size` (binary: K=1024, M=1024^2, etc. — same as dd behavior).
 - Volume hash is computed **in parallel** via background `openssl dgst -sha3-256` while the segment `dd` reads the source (populates page cache; hash reads from cache).
+- Headers are deferred: dd writes data first, then headers are appended in a second pass after the hash is collected.
 - `conv=sync` removed — last segment count is recalculated per iteration to avoid zero-padding.
 - `get_vol_hash` / `get_calculated_count` removed — inlined or replaced.
 

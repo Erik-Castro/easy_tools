@@ -118,8 +118,8 @@ all_params_is_valid() {
         exit 1
     fi
 
-    buffer_size_bytes=$(numfmt --from=auto $BUFFER_SIZE)
-    segment_size_bytes=$(numfmt --from=auto $SEGMENT_SIZE)
+    buffer_size_bytes=$(parse_size $BUFFER_SIZE)
+    segment_size_bytes=$(parse_size $SEGMENT_SIZE)
 
     if ((buffer_size_bytes < 512)); then
         msg_error "O tamanho do buffer é muito pequeno. Escolha algo maior que 512B."
@@ -190,6 +190,22 @@ get_vol_info() {
 
 get_timestamp() {
     date -u '+%Y-%m-%dT%H:%M:%SZ'
+}
+
+# Converte tamanhos com sufixo para bytes (tratando K/M/G como binário, igual ao dd)
+parse_size() {
+    local input="$1"
+    local num=${input%[KMGTPYkMmgttpy]}
+    local suffix="${input: -1}"
+    case "$suffix" in
+        K|k) echo $((num * 1024)) ;;
+        M|m) echo $((num * 1024 * 1024)) ;;
+        G|g) echo $((num * 1024 * 1024 * 1024)) ;;
+        T|t) echo $((num * 1024 * 1024 * 1024 * 1024)) ;;
+        P|p) echo $((num * 1024 * 1024 * 1024 * 1024 * 1024)) ;;
+        Y|y) echo $((num * 1024 * 1024 * 1024 * 1024 * 1024 * 1024)) ;;
+        *) echo "$input" ;;
+    esac
 }
 
 get_hash() {
@@ -304,8 +320,8 @@ create_segments() {
     local total_size="$TOTAL_BYTES_VOL"
 
     local seg_size_bytes buf_size_bytes
-    seg_size_bytes=$(numfmt --from=auto "$segment_size")
-    buf_size_bytes=$(numfmt --from=auto "$buffer_size")
+    seg_size_bytes=$(parse_size "$segment_size")
+    buf_size_bytes=$(parse_size "$buffer_size")
 
     if [[ ! -d "$dest_dir" ]]; then
         mkdir -p "$dest_dir" || {
@@ -314,7 +330,7 @@ create_segments() {
         }
     fi
 
-    local required_space=$(numfmt --from=auto "$SEGMENT_SIZE")
+    local required_space=$(parse_size "$SEGMENT_SIZE")
     local available_space=$(df --output=avail "$DEST_DIR" | tail -1)
     if ((required_space > available_space * 1024)); then
         msg_error "Espaço insuficiente em '$DEST_DIR'. Necessário: '$SEGMENT_SIZE'."
@@ -327,24 +343,25 @@ create_segments() {
     local uuid
     uuid="$(get_uuid)" || exit $?
 
-    # Inicia o hash do volume em background, paralelo à leitura dos segmentos
-    # O kernel serve os dados do cache (populado pelo dd dos segmentos)
     echo -e "\e[1;32m\tCalculando a hash do volume em paralelo...\n\e[0m"
     ( openssl dgst -sha3-256 "$SRC" 2>/dev/null | awk '{print $2}' > "$VOL_HASH_FILE" ) &
     local vol_hash_pid=$!
+
+    local -a seg_files
+    local -a seg_hashes
+    local -a seg_timestamps
+    local -a seg_offsets
 
     while ((offset < total_size)); do
         segment_file="$dest_dir/${IMAGE_NAME}$(printf "%05d" "$segment_num").bin"
 
         local current_size=$seg_size_bytes
-        local is_last=0
         if ((offset + current_size > total_size)); then
             current_size=$((total_size - offset))
-            is_last=1
         fi
 
         local current_count=$((current_size / buf_size_bytes))
-        [[ $((current_size % buf_size_bytes)) -ne 0 ]] && ((current_count++))
+        [[ $((current_size % buf_size_bytes)) -ne 0 ]] && ((++current_count))
 
         progress_bar $offset $total_size "Criando segmento ${segment_file}" $term_width
         dd if="$SRC" of="$segment_file" iflag=fullblock status=none bs="$buf_size_bytes" skip=$((offset / buf_size_bytes)) count="$current_count" || {
@@ -352,17 +369,19 @@ create_segments() {
             exit 6
         }
 
+        progress_bar $offset $total_size "Calculando o hash do segmento ${segment_file}" $term_width
         segment_hash="$(get_hash "$segment_file")"
         timestamp="$(get_timestamp)"
-        progress_bar $offset $total_size "Calculando o hash do segmento ${segment_file}" $term_width
 
-        write_head "${DEVICE_MODEL}" "${SERIAL_DEVICE}" "${NAME_DEVICE}" "$timestamp" "$offset" "$segment_num" "$(wc -c < "$segment_file")" "$segment_hash" "$volume_hash" "$uuid" "$is_last" >>"$segment_file"
+        seg_files+=("$segment_file")
+        seg_hashes+=("$segment_hash")
+        seg_timestamps+=("$timestamp")
+        seg_offsets+=("$offset")
 
-        progress_bar $offset $total_size "Cabeçalho do segmento ${segment_file} criado!" $term_width
+        progress_bar $offset $total_size "Segmento ${segment_file} concluído!" $term_width
 
         ((offset += current_size))
         ((segment_num++))
-        progress_bar $offset $total_size "Segmento criado com sucesso!" $term_width
     done
 
     wait $vol_hash_pid 2>/dev/null || true
@@ -375,7 +394,21 @@ create_segments() {
         exit 3
     fi
 
-    echo -e "\t\e[1mA clonagem foi realizada com sucesso!\e[0m"
+    progress_bar 100 100 "Anexando cabeçalhos..." $term_width
+    local seg_count=${#seg_files[@]}
+    for ((i = 0; i < seg_count; i++)); do
+        local is_last=0
+        ((i == seg_count - 1)) && is_last=1
+        local seg_num=$((i + 1))
+        local seg_size
+        seg_size=$(wc -c < "${seg_files[i]}")
+
+        progress_bar $i $seg_count "Cabeçalho do segmento ${seg_files[i]}" $term_width
+        write_head "${DEVICE_MODEL}" "${SERIAL_DEVICE}" "${NAME_DEVICE}" "${seg_timestamps[i]}" "${seg_offsets[i]}" "$seg_num" "$seg_size" "${seg_hashes[i]}" "$volume_hash" "$uuid" "$is_last" >> "${seg_files[i]}"
+    done
+    progress_bar $seg_count $seg_count "Cabeçalhos concluídos!" $term_width
+
+    echo -e "\n\t\e[1mA clonagem foi realizada com sucesso!\e[0m"
 }
 
 all_params_is_valid $SEGMENT_SIZE $BUFFER_SIZE
