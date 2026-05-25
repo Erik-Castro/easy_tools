@@ -6,6 +6,7 @@
 # Version 0.2.0-alpha: Refactored code
 # Version 0.3.5-beta: Bug fixes, code improvements and visual
 # Version 0.4.0-beta: Bug fixes, performance improvements, code cleanup
+# Version 0.5.0-beta: Single-pass I/O, robustness improvements
 # Author: Erik Castro
 # License: MIT
 #
@@ -34,6 +35,7 @@ SEGMENT_SIZE="1G"
 SOURCE=""
 DEST_DIR=""
 HEADER_NOTES=""
+VOL_HASH_FILE="/tmp/vol_hash.$$"
 
 while getopts ":s:d:n:S:B:hN:" opt; do
     case $opt in
@@ -58,6 +60,10 @@ done
 msg_error() {
     echo -e "\e[1;41m[ERRO]:\e[0;1m ${*} - $(date +%c)\e[0m" >&2
 }
+
+# Garante limpeza mesmo em caso de interrupção
+trap 'rm -f "$VOL_HASH_FILE" 2>/dev/null; exit 1' INT TERM
+trap 'rm -f "$VOL_HASH_FILE" 2>/dev/null' EXIT
 
 get_version() {
     if [[ ! -r $0 ]]; then
@@ -195,51 +201,14 @@ get_hash() {
     local algorithm="sha3-256"
 
     if [[ -z ${1+x} ]]; then
-        hash_output=$(openssl dgst -"$algorithm" 2>/dev/null)
-        if [[ $? -ne 0 ]]; then
-            echo "Erro: Falha ao calcular o hash com o algoritmo '$algorithm'." >&2
-            exit 3
-        fi
-        echo -n "$hash_output" | awk '{print $2}'
+        openssl dgst -"$algorithm" 2>/dev/null | awk '{print $2}'
     else
         if [[ ! -f "$1" ]]; then
             echo "Erro: O arquivo '$1' não foi encontrado." >&2
             exit 4
         fi
-
-        hash_output=$(openssl dgst -"$algorithm" "$1" 2>/dev/null)
-        if [[ $? -ne 0 ]]; then
-            echo "Erro: Falha ao calcular o hash com o algoritmo '$algorithm'." >&2
-            exit 3
-        fi
-        echo -n "$hash_output" | awk '{print $2}'
+        openssl dgst -"$algorithm" "$1" 2>/dev/null | awk '{print $2}'
     fi
-}
-
-get_vol_hash() {
-    local src="${1:-$SOURCE}"
-    local bs="${2:-64K}"
-
-    if [[ -z "$src" ]]; then
-        msg_error "A variável SOURCE não está definida. Por favor, defina o caminho do volume."
-        return 1
-    fi
-
-    if [[ ! -e "$src" ]]; then
-        msg_error "O arquivo ou volume '$src' não foi encontrado."
-        return 2
-    fi
-
-    local vol_hash
-    vol_hash=$(dd if="$src" bs="$bs" iflag=fullblock status=none 2>/dev/null | openssl dgst -sha3-256 | awk '{print $2}')
-
-    if [[ -z "$vol_hash" ]]; then
-        msg_error "Falha ao calcular o hash do volume."
-        return 3
-    fi
-
-    echo $vol_hash
-    return 0
 }
 
 write_head() {
@@ -260,7 +229,8 @@ progress_bar() {
     local progress=$1
     local progress_total=$2
     local msg="$3"
-    local term_width percentage num_blocks bar_width bar rst
+    local term_width="${4:-$(tput cols)}"
+    local percentage num_blocks bar_width bar rst
 
     rst="\e[0m"
 
@@ -275,7 +245,6 @@ progress_bar() {
     fi
 
     percentage=$(((progress * 100) / progress_total))
-    term_width=$(tput cols)
 
     if [[ -z ${3+x} ]]; then
         bar_width=$term_width
@@ -320,7 +289,6 @@ create_segments() {
     local dest_dir="$2"
     local segment_size="$3"
     local buffer_size="$4"
-    local uuid="$(get_uuid)"
     local segment_num=1 offset=0
     local segment_file segment_hash timestamp volume_hash
 
@@ -335,12 +303,9 @@ create_segments() {
     fi
     local total_size="$TOTAL_BYTES_VOL"
 
-    local seg_size_bytes buf_size_bytes blk_per_seg
+    local seg_size_bytes buf_size_bytes
     seg_size_bytes=$(numfmt --from=auto "$segment_size")
     buf_size_bytes=$(numfmt --from=auto "$buffer_size")
-
-    blk_per_seg=$((seg_size_bytes / buf_size_bytes))
-    [[ $((seg_size_bytes % buf_size_bytes)) -ne 0 ]] && ((blk_per_seg++))
 
     if [[ ! -d "$dest_dir" ]]; then
         mkdir -p "$dest_dir" || {
@@ -349,8 +314,24 @@ create_segments() {
         }
     fi
 
-    echo -e "\e[1;32m\tCalculando a hash do volume.\tEste é um processo demorado, que vai depender de suas configurações de hardware.\n\e[0m"
-    volume_hash="$(get_vol_hash "$SRC" "$buffer_size")"
+    local required_space=$(numfmt --from=auto "$SEGMENT_SIZE")
+    local available_space=$(df --output=avail "$DEST_DIR" | tail -1)
+    if ((required_space > available_space * 1024)); then
+        msg_error "Espaço insuficiente em '$DEST_DIR'. Necessário: '$SEGMENT_SIZE'."
+        exit 7
+    fi
+
+    local term_width
+    term_width=$(tput cols)
+
+    local uuid
+    uuid="$(get_uuid)" || exit $?
+
+    # Inicia o hash do volume em background, paralelo à leitura dos segmentos
+    # O kernel serve os dados do cache (populado pelo dd dos segmentos)
+    echo -e "\e[1;32m\tCalculando a hash do volume em paralelo...\n\e[0m"
+    ( openssl dgst -sha3-256 "$SRC" 2>/dev/null | awk '{print $2}' > "$VOL_HASH_FILE" ) &
+    local vol_hash_pid=$!
 
     while ((offset < total_size)); do
         segment_file="$dest_dir/${IMAGE_NAME}$(printf "%05d" "$segment_num").bin"
@@ -365,33 +346,35 @@ create_segments() {
         local current_count=$((current_size / buf_size_bytes))
         [[ $((current_size % buf_size_bytes)) -ne 0 ]] && ((current_count++))
 
-        local required_space=$(numfmt --from=auto "$SEGMENT_SIZE")
-        local available_space=$(df --output=avail "$DEST_DIR" | tail -1)
-
-        if ((required_space > available_space * 1024)); then
-            msg_error "Espaço insuficiente em '$DEST_DIR'. Necessário: '$SEGMENT_SIZE'."
-            exit 7
-        fi
-
-        progress_bar $offset $total_size "Criando segmento ${segment_file}"
-        dd if="$SRC" of="$segment_file" iflag=fullblock status=none bs="$buf_size_bytes" skip=$((offset / buf_size_bytes)) count="$current_count"
-        if [[ $? -ne 0 ]]; then
+        progress_bar $offset $total_size "Criando segmento ${segment_file}" $term_width
+        dd if="$SRC" of="$segment_file" iflag=fullblock status=none bs="$buf_size_bytes" skip=$((offset / buf_size_bytes)) count="$current_count" || {
             msg_error "Falha ao executar o comando dd. Verifique as permissões ou o destino."
             exit 6
-        fi
+        }
 
         segment_hash="$(get_hash "$segment_file")"
         timestamp="$(get_timestamp)"
-        progress_bar $offset $total_size "Calculando o hash do segmento ${segment_file}"
+        progress_bar $offset $total_size "Calculando o hash do segmento ${segment_file}" $term_width
 
         write_head "${DEVICE_MODEL}" "${SERIAL_DEVICE}" "${NAME_DEVICE}" "$timestamp" "$offset" "$segment_num" "$(wc -c < "$segment_file")" "$segment_hash" "$volume_hash" "$uuid" "$is_last" >>"$segment_file"
 
-        progress_bar $offset $total_size "Cabeçalho do segmento ${segment_file} criado!"
+        progress_bar $offset $total_size "Cabeçalho do segmento ${segment_file} criado!" $term_width
 
         ((offset += current_size))
         ((segment_num++))
-        progress_bar $offset $total_size "Segmento criado com sucesso!"
+        progress_bar $offset $total_size "Segmento criado com sucesso!" $term_width
     done
+
+    wait $vol_hash_pid 2>/dev/null || true
+    if [[ -f "$VOL_HASH_FILE" ]]; then
+        volume_hash=$(cat "$VOL_HASH_FILE")
+    fi
+
+    if [[ -z "$volume_hash" ]]; then
+        msg_error "Falha ao calcular o hash do volume."
+        exit 3
+    fi
+
     echo -e "\t\e[1mA clonagem foi realizada com sucesso!\e[0m"
 }
 
