@@ -25,6 +25,7 @@ show_help() {
     echo "  -B <buffer_size>      Tamanho do buffer para dd (ex.: 32M, 64K)."
     echo "  -n <name_of_file>     Prefixo dos arquivos de segmento."
     echo "  -N <notes>            Notas para o cabeçalho."
+    echo "  -V, --version         Exibe a versão do script."
     echo
     echo "Modo restore:"
     echo "  -r                    Modo restore (restaurar imagem a partir dos segmentos)."
@@ -34,6 +35,7 @@ show_help() {
     echo "Exemplos:"
     echo "  $0 -s /dev/sda -d /backups -S 1G -B 32M -n case -N Case123"
     echo "  $0 -r -s /backups -d /imagem_restaurada.img"
+    echo "  $0 --version"
     exit 0
 }
 
@@ -46,7 +48,32 @@ HEADER_NOTES=""
 RESTORE_MODE=""
 VOL_HASH_FILE="/tmp/vol_hash.$$"
 
-while getopts ":rs:d:n:S:B:hN:" opt; do
+get_version() {
+    if [[ ! -r $0 ]]; then
+        echo "Erro: Não foi possível ler o arquivo do script." >&2
+        exit 1
+    fi
+
+    local version_line
+    version_line=$(grep "^# Version " "$0" | tail -1)
+
+    if [[ -z "$version_line" ]]; then
+        echo "Aviso: A versão do script não foi encontrada." >&2
+        return 1
+    fi
+
+    local version
+    version=$(echo "$version_line" | sed 's/^# *//; s/ *:.*//')
+
+    echo "$version"
+}
+
+if [[ "$1" == "--version" ]]; then
+    get_version
+    exit 0
+fi
+
+while getopts ":rs:d:n:S:B:hVN:" opt; do
     case $opt in
     r) RESTORE_MODE=1 ;;
     s) SOURCE="$OPTARG" ;;
@@ -55,6 +82,7 @@ while getopts ":rs:d:n:S:B:hN:" opt; do
     S) SEGMENT_SIZE="$OPTARG" ;;
     B) BUFFER_SIZE="$OPTARG" ;;
     h) show_help ;;
+    V) get_version; exit 0 ;;
     N) HEADER_NOTES="${OPTARG}" ;;
     \?)
         echo "Erro: Opção inválida -$OPTARG" >&2
@@ -74,26 +102,6 @@ msg_error() {
 # Garante limpeza mesmo em caso de interrupção
 trap 'rm -f "$VOL_HASH_FILE" 2>/dev/null; exit 1' INT TERM
 trap 'rm -f "$VOL_HASH_FILE" 2>/dev/null' EXIT
-
-get_version() {
-    if [[ ! -r $0 ]]; then
-        echo "Erro: Não foi possível ler o arquivo do script." >&2
-        exit 1
-    fi
-
-    local version_line
-    version_line=$(grep "^# Version " "$0" | tail -1)
-
-    if [[ -z "$version_line" ]]; then
-        echo "Aviso: A versão do script não foi encontrada." >&2
-        return 1
-    fi
-
-    local version
-    version=$(echo "$version_line" | tr -d '\#' | cut -d':' -f1)
-
-    echo $version
-}
 
 all_params_is_valid() {
     local segment=$1
