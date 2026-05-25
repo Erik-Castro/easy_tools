@@ -291,21 +291,12 @@ parse_header() {
         return 1
     fi
 
-    local fields="${header_without_hash#|}"
-    local entry key value
-    while IFS='|' read -ra entries; do
-        for entry in "${entries[@]}"; do
-            key="${entry%%:*}"
-            value="${entry#*:}"
-            case "$key" in
-                HASH_SEGMENT) seg_hash="$value" ;;
-                SEGMENT_NUMBER) seg_num="$value" ;;
-                IS_LAST) is_last="$value" ;;
-                HASH_VOLUME) hash_volume="$value" ;;
-                OFFSET) seg_offset="$value" ;;
-            esac
-        done
-    done <<< "$fields"
+    # Extrai campos com grep (robusto contra pipes dentro de valores, ex.: NOTES)
+    seg_hash=$(echo "$header_without_hash" | grep -oP '(?<=\|HASH_SEGMENT:)[^|]+' | tail -1)
+    seg_num=$(echo "$header_without_hash" | grep -oP '(?<=\|SEGMENT_NUMBER:)[^|]+' | tail -1)
+    is_last=$(echo "$header_without_hash" | grep -oP '(?<=\|IS_LAST:)[^|]+' | tail -1)
+    hash_volume=$(echo "$header_without_hash" | grep -oP '(?<=\|HASH_VOLUME:)[^|]+' | tail -1)
+    seg_offset=$(echo "$header_without_hash" | grep -oP '(?<=\|OFFSET:)[^|]+' | tail -1)
 
     if [[ -z "$seg_hash" || -z "$seg_num" || -z "$is_last" ]]; then
         msg_error "Campos obrigatórios ausentes no cabeçalho de '$seg_file'."
