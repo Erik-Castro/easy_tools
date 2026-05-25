@@ -7,6 +7,7 @@
 # Version 0.3.5-beta: Bug fixes, code improvements and visual
 # Version 0.4.0-beta: Bug fixes, performance improvements, code cleanup
 # Version 0.5.0-beta: Single-pass I/O, robustness improvements
+# Version 0.6.0-beta: Restore mode, header validation, segment reconstruction
 # Author: Erik Castro
 # License: MIT
 #
@@ -14,18 +15,25 @@
 set -euo pipefail
 
 show_help() {
-    echo "Usage: $0 -s <source> -d <destination_dir> -S <segment_size> -B <buffer_size> -n <name_of_file>"
+    echo "Modo clone: $0 -s <device> -d <dir> -S <size> -B <size> -n <name> [-N <notes>]"
+    echo "Modo restore: $0 -r -s <seg_dir> -d <output_file>"
     echo
-    echo "Arguments:"
-    echo "  -s <source>           Source device or file to clone (e.g., /dev/sda)."
-    echo "  -d <destination_dir>  Directory to store the output segments."
-    echo "  -S <segment_size>     Size of each segment (e.g., 1G, 512M)."
-    echo "  -B <buffer_size>      Buffer size for dd operations (e.g., 32M, 64K)."
-    echo "  -n <name_of_file>     Name prefix for the output segments."
-    echo "  -N <notes>            Insert notes into the header."
+    echo "Modo clone:"
+    echo "  -s <source>           Dispositivo ou arquivo de origem."
+    echo "  -d <destination_dir>  Diretório para armazenar os segmentos."
+    echo "  -S <segment_size>     Tamanho de cada segmento (ex.: 1G, 512M)."
+    echo "  -B <buffer_size>      Tamanho do buffer para dd (ex.: 32M, 64K)."
+    echo "  -n <name_of_file>     Prefixo dos arquivos de segmento."
+    echo "  -N <notes>            Notas para o cabeçalho."
     echo
-    echo "Example:"
-    echo "  $0 -s /dev/sda -d /backups -S 1G -B 32M -n segment_file -N CaseID123456-89"
+    echo "Modo restore:"
+    echo "  -r                    Modo restore (restaurar imagem a partir dos segmentos)."
+    echo "  -s <seg_dir>          Diretório com os segmentos .bin."
+    echo "  -d <output_file>      Arquivo de saída da imagem restaurada."
+    echo
+    echo "Exemplos:"
+    echo "  $0 -s /dev/sda -d /backups -S 1G -B 32M -n case -N Case123"
+    echo "  $0 -r -s /backups -d /imagem_restaurada.img"
     exit 0
 }
 
@@ -35,10 +43,12 @@ SEGMENT_SIZE="1G"
 SOURCE=""
 DEST_DIR=""
 HEADER_NOTES=""
+RESTORE_MODE=""
 VOL_HASH_FILE="/tmp/vol_hash.$$"
 
-while getopts ":s:d:n:S:B:hN:" opt; do
+while getopts ":rs:d:n:S:B:hN:" opt; do
     case $opt in
+    r) RESTORE_MODE=1 ;;
     s) SOURCE="$OPTARG" ;;
     d) DEST_DIR="$OPTARG" ;;
     n) IMAGE_NAME="$OPTARG" ;;
@@ -241,6 +251,70 @@ EOF
     echo -n "${header}|HEADER_HASH:${hash_header}"
 }
 
+# Lê e valida o cabeçalho de um segmento. Imprime pipe-delimited:
+# data_start|hash_segment|hash_volume|segment_number|is_last|offset
+parse_header() {
+    local seg_file="$1"
+    local file_size=$(stat -c%s "$seg_file")
+    local seg_hash seg_num is_last data_start data_size hash_volume seg_offset
+
+    local tail_size=2048
+    [[ tail_size -gt file_size ]] && tail_size=$file_size
+    local tail_offset=$((file_size - tail_size))
+
+    local model_info
+    model_info=$(dd if="$seg_file" bs=1 skip="$tail_offset" count="$tail_size" 2>/dev/null | grep -a -b -o -P '\|MODEL:' 2>/dev/null | tail -1)
+    if [[ -z "$model_info" ]]; then
+        msg_error "Cabeçalho inválido em '$seg_file': marcador MODEL ausente."
+        return 1
+    fi
+    local model_rel_pos="${model_info%%:*}"
+    data_start=$((tail_offset + model_rel_pos))
+    data_size=$data_start
+
+    local hash_info
+    hash_info=$(dd if="$seg_file" bs=1 skip="$tail_offset" count="$tail_size" 2>/dev/null | grep -a -b -o -P '\|HEADER_HASH:[a-f0-9]+' 2>/dev/null | tail -1)
+    if [[ -z "$hash_info" ]]; then
+        msg_error "Cabeçalho inválido em '$seg_file': marcador HEADER_HASH ausente."
+        return 1
+    fi
+    local hash_value="${hash_info##*:}"
+
+    local header_text
+    header_text=$(dd if="$seg_file" bs=1 skip="$data_start" count=$((file_size - data_start)) 2>/dev/null | tr -d '\0')
+
+    local header_without_hash="${header_text%|HEADER_HASH:*}"
+    local expected_hash
+    expected_hash=$(echo -n "$header_without_hash" | get_hash | awk '{print $1}')
+    if [[ "$expected_hash" != "$hash_value" ]]; then
+        msg_error "HEADER_HASH inválido em '$seg_file'. Arquivo corrompido."
+        return 1
+    fi
+
+    local fields="${header_without_hash#|}"
+    local entry key value
+    while IFS='|' read -ra entries; do
+        for entry in "${entries[@]}"; do
+            key="${entry%%:*}"
+            value="${entry#*:}"
+            case "$key" in
+                HASH_SEGMENT) seg_hash="$value" ;;
+                SEGMENT_NUMBER) seg_num="$value" ;;
+                IS_LAST) is_last="$value" ;;
+                HASH_VOLUME) hash_volume="$value" ;;
+                OFFSET) seg_offset="$value" ;;
+            esac
+        done
+    done <<< "$fields"
+
+    if [[ -z "$seg_hash" || -z "$seg_num" || -z "$is_last" ]]; then
+        msg_error "Campos obrigatórios ausentes no cabeçalho de '$seg_file'."
+        return 1
+    fi
+
+    echo "$data_start|$seg_hash|$hash_volume|$seg_num|$is_last|$seg_offset"
+}
+
 progress_bar() {
     local progress=$1
     local progress_total=$2
@@ -411,6 +485,117 @@ create_segments() {
     echo -e "\n\t\e[1mA clonagem foi realizada com sucesso!\e[0m"
 }
 
-all_params_is_valid $SEGMENT_SIZE $BUFFER_SIZE
-echo -e "\e[1;33m\tEste software está em desenvolvimento, talvez apresente bugs e falhas.\n\tVocê é totalmente responsável pelo uso e como usa este software.\e[0m\n"
-create_segments "$SOURCE" "$DEST_DIR" "$SEGMENT_SIZE" "$BUFFER_SIZE"
+restore_segments() {
+    local seg_dir="$1"
+    local output_file="$2"
+
+    if [[ ! -d "$seg_dir" ]]; then
+        msg_error "Diretório de segmentos '$seg_dir' não encontrado."
+        exit 1
+    fi
+
+    if [[ -e "$output_file" ]]; then
+        msg_error "Arquivo de saída '$output_file' já existe. Remova-o primeiro."
+        exit 1
+    fi
+
+    local seg_files=("$seg_dir"/*.bin)
+    if [[ ${#seg_files[@]} -eq 0 ]]; then
+        msg_error "Nenhum arquivo .bin encontrado em '$seg_dir'."
+        exit 1
+    fi
+
+    local sorted=()
+    for f in "${seg_files[@]}"; do
+        local base=$(basename "$f")
+        local num=$(echo "$base" | grep -oP '\d{5,}(?=\.bin$)')
+        if [[ -z "$num" ]]; then
+            msg_error "Nome de arquivo inválido: '$base'. Esperado: <prefixo>_NNNNN.bin"
+            exit 1
+        fi
+        sorted+=("$((10#$num))|$f")
+    done
+    IFS=$'\n' sorted=($(sort -t'|' -k1 -n <<< "${sorted[*]}")); unset IFS
+
+    local seg_count=${#sorted[@]}
+    local term_width
+    term_width=$(tput cols)
+
+    local volume_hash=""
+    local expected_num=1
+    local errors=0
+
+    for entry in "${sorted[@]}"; do
+        local file="${entry#*|}"
+        local base=$(basename "$file")
+
+        local header_data
+        header_data=$(parse_header "$file") || { ((errors++)); continue; }
+        local data_start seg_hash seg_hash_vol seg_num seg_is_last seg_offset
+        IFS='|' read -r data_start seg_hash seg_hash_vol seg_num seg_is_last seg_offset <<< "$header_data"
+
+        if [[ -z "$volume_hash" && -n "$seg_hash_vol" ]]; then
+            volume_hash="$seg_hash_vol"
+        fi
+
+        local file_num=$((10#$(echo "$base" | grep -oP '\d{5,}(?=\.bin$)')))
+        if ((file_num != seg_num)); then
+            msg_error "$base: número do arquivo ($file_num) difere do cabeçalho ($seg_num)."
+            ((errors++))
+            continue
+        fi
+        if ((seg_num != expected_num)); then
+            msg_error "Segmento $seg_num fora de ordem. Esperado: $expected_num."
+            ((errors++))
+            continue
+        fi
+        expected_num=$((seg_num + 1))
+
+        progress_bar $((seg_num - 1)) $seg_count "Validando $base" $term_width
+
+        local computed_hash
+        computed_hash=$(dd if="$file" bs=64K iflag=count_bytes count="$data_start" status=none 2>/dev/null | tee -a "$output_file" | openssl dgst -sha3-256 | awk '{print $2}')
+
+        if [[ "$computed_hash" != "$seg_hash" ]]; then
+            msg_error "$base: hash do segmento não confere (dados corrompidos)."
+            rm -f "$output_file"
+            exit 1
+        fi
+    done
+
+    if ((errors > 0)); then
+        msg_error "$errors segmentos com erro. Restauração abortada."
+        rm -f "$output_file"
+        exit 1
+    fi
+
+    progress_bar $seg_count $seg_count "Verificando hash final..." $term_width
+
+    if [[ -z "$volume_hash" ]]; then
+        msg_error "HASH_VOLUME não encontrado em nenhum segmento."
+        rm -f "$output_file"
+        exit 1
+    fi
+
+    local final_hash
+    final_hash=$(openssl dgst -sha3-256 "$output_file" 2>/dev/null | awk '{print $2}')
+    if [[ "$final_hash" != "$volume_hash" ]]; then
+        msg_error "Hash do arquivo restaurado difere do HASH_VOLUME original."
+        rm -f "$output_file"
+        exit 1
+    fi
+
+    echo -e "\n\t\e[1mA restauração foi realizada com sucesso!\e[0m"
+}
+
+if [[ -n "$RESTORE_MODE" ]]; then
+    if [[ -z "$SOURCE" || -z "$DEST_DIR" ]]; then
+        echo "Erro: Modo restore requer -s (diretório de segmentos) e -d (arquivo de saída)." >&2
+        show_help
+    fi
+    restore_segments "$SOURCE" "$DEST_DIR"
+else
+    all_params_is_valid $SEGMENT_SIZE $BUFFER_SIZE
+    echo -e "\e[1;33m\tEste software está em desenvolvimento, talvez apresente bugs e falhas.\n\tVocê é totalmente responsável pelo uso e como usa este software.\e[0m\n"
+    create_segments "$SOURCE" "$DEST_DIR" "$SEGMENT_SIZE" "$BUFFER_SIZE"
+fi
